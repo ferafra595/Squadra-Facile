@@ -8,8 +8,9 @@ async function hashPassword(pass,salt){let k=await crypto.subtle.importKey('raw'
 const valid=(v,n=150)=>typeof v==='string'&&v.trim().length>0&&v.trim().length<=n;
 const clean=(v,n=150)=>typeof v==='string'?v.trim().slice(0,n):'';
 async function auth(db,request){let c=request.headers.get('cookie')||'';let t=c.match(/(?:^|;\s*)sf_session=([a-f0-9]{64})(?:;|$)/)?.[1];if(!t)return null;return db.prepare("SELECT users.id,users.email FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.id_hash=? AND sessions.expires_at>datetime('now')").bind(await sha(t)).first()}
+const adminCookie=(t,maxAge)=>`sf_admin=${t}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
 const cookie=(t,maxAge)=>`sf_session=${t}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
-async function teamAuth(db,user,teamId){if(!user||!teamId)return null;return db.prepare('SELECT role FROM team_members WHERE team_id=? AND user_id=?').bind(teamId,user.id).first()}
+async function teamAuth(db,user,teamId){if(!user||!teamId)return null;let disabled=await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(teamId).first();if(disabled)return null;return db.prepare('SELECT role FROM team_members WHERE team_id=? AND user_id=?').bind(teamId,user.id).first()}
 async function readBody(req){let len=Number(req.headers.get('content-length')||0);if(len>16000)throw Error('Richiesta troppo grande');return req.json()}
 export async function onRequest({request,env}){
  const url=new URL(request.url),p=url.pathname;
@@ -17,8 +18,27 @@ export async function onRequest({request,env}){
  if(!env.DB)return err('Database D1 non collegato: aggiungi il binding DB su Cloudflare Pages.',503);
  const db=env.DB;
  if(request.method==='GET'&&p==='/api/status'){try{await db.prepare('SELECT id FROM users LIMIT 1').first();return json({ok:true})}catch{return err('Schema non applicato. Esegui schema.sql nel database D1.',503)}}
- const adminUser=await auth(db,request);
- const isAdmin=!!adminUser&&!!env.ADMIN_USER_ID&&adminUser.id===env.ADMIN_USER_ID;
+ const adminToken=(request.headers.get('cookie')||'').match(/(?:^|;\s*)sf_admin=([a-f0-9]{64})(?:;|$)/)?.[1];
+ const adminSession=adminToken?await db.prepare("SELECT id_hash FROM sf_admin_sessions WHERE id_hash=? AND expires_at>datetime('now')").bind(await sha(adminToken)).first():null;
+ const isAdmin=!!adminSession;
+ const adminUser={email:env.ADMIN_EMAIL||'ADMIN'};
+ if(request.method==='POST'&&p==='/api/admin/login'){
+  if(!request.headers.get('content-type')?.startsWith('application/json'))return err('Invia JSON',415);
+  const origin=request.headers.get('origin');if(origin&&origin!==url.origin)return err('Origine non autorizzata',403);
+  let b;try{b=await readBody(request)}catch{return err('Dati non validi')}
+  if(!env.ADMIN_EMAIL||!env.ADMIN_PASSWORD)return err('Imposta ADMIN_EMAIL e ADMIN_PASSWORD nei Secrets Cloudflare',503);
+  const expected=await sha(env.ADMIN_EMAIL.trim().toLowerCase()+'\n'+env.ADMIN_PASSWORD);
+  const actual=await sha(String(b.email||'').trim().toLowerCase()+'\n'+String(b.password||''));
+  let diff=0;for(let i=0;i<expected.length;i++)diff|=expected.charCodeAt(i)^actual.charCodeAt(i);
+  if(diff!==0)return err('Credenziali ADMIN non valide',401);
+  const t=token();await db.prepare("INSERT INTO sf_admin_sessions(id_hash,expires_at) VALUES(?,datetime('now','+12 hours'))").bind(await sha(t)).run();
+  return json({ok:true},200,{'set-cookie':adminCookie(t,43200)});
+ }
+ if(request.method==='POST'&&p==='/api/admin/logout'){
+  if(adminToken)await db.prepare('DELETE FROM sf_admin_sessions WHERE id_hash=?').bind(await sha(adminToken)).run();
+  return json({ok:true},200,{'set-cookie':adminCookie('',0)});
+ }
+ if(request.method==='GET'&&p==='/api/admin/session')return json({isAdmin});
  if(p.startsWith('/api/admin')){
   if(!isAdmin)return err('Accesso ADMIN non autorizzato',403);
   try{
@@ -28,7 +48,7 @@ export async function onRequest({request,env}){
      db.prepare(`SELECT t.id,t.name,t.format,t.created_at,COUNT(DISTINCT p.id) players,COUNT(DISTINCT e.id) events,GROUP_CONCAT(DISTINCT u.email) owners FROM teams t LEFT JOIN players p ON p.team_id=t.id LEFT JOIN events e ON e.team_id=t.id LEFT JOIN team_members m ON m.team_id=t.id AND m.role='owner' LEFT JOIN users u ON u.id=m.user_id GROUP BY t.id ORDER BY t.created_at DESC LIMIT 500`).all(),
      db.prepare(`SELECT u.id,u.email,u.created_at,COUNT(DISTINCT m.team_id) teams FROM users u LEFT JOIN team_members m ON m.user_id=u.id GROUP BY u.id ORDER BY u.created_at DESC LIMIT 500`).all(),
      db.prepare('SELECT actor_email,action,target,created_at FROM admin_audit ORDER BY created_at DESC LIMIT 100').all()]);
-    return json({stats:{users:users.n,teams:teams.n,players:players.n,events:events.n},teams:teamRows.results,users:userRows.results,logs:logs.results,subscriptions:{status:'not_connected',message:'Stripe non collegato: nessun ricavo o abbonamento verificato'}})
+    const disabled=await db.prepare('SELECT team_id FROM sf_disabled_teams').all();const disabledIds=new Set(disabled.results.map(x=>x.team_id));return json({stats:{users:users.n,teams:teams.n,players:players.n,events:events.n},teams:teamRows.results.map(t=>({...t,disabled:disabledIds.has(t.id)})),users:userRows.results,logs:logs.results,subscriptions:{status:'not_connected',message:'Stripe non collegato: nessun ricavo o abbonamento verificato'}})
    }
    if(request.method==='GET'&&p==='/api/admin/team'){
     let id=url.searchParams.get('id');if(!id)return err('Squadra mancante');let team=await db.prepare('SELECT * FROM teams WHERE id=?').bind(id).first();if(!team)return err('Squadra non trovata',404);
@@ -38,8 +58,27 @@ export async function onRequest({request,env}){
     if(!request.headers.get('content-type')?.startsWith('application/json'))return err('Invia JSON',415);
     const origin=request.headers.get('origin');if(origin&&origin!==url.origin)return err('Origine non autorizzata',403);
     let b;try{b=await readBody(request)}catch{return err('JSON non valido')}
+    if(b.op==='adminCreateTeam'){
+     let email=clean(b.email,254).toLowerCase(),pass=b.password,name=clean(b.name,100),format=Number(b.format);
+     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!valid(pass,200)||pass.length<10||!name||![5,7,11].includes(format))return err('Inserisci squadra, formato, email e password di almeno 10 caratteri');
+     let user=await db.prepare('SELECT id FROM users WHERE email=?').bind(email).first();let userId=user?.id||uid(),teamId=uid();
+     if(!user){let salt=token(),h=await hashPassword(pass,salt);await db.prepare('INSERT INTO users(id,email,password_hash,salt) VALUES(?,?,?,?)').bind(userId,email,h,salt).run()}
+     else return err('Email già presente: utilizza un indirizzo diverso',409);
+     await db.batch([db.prepare('INSERT INTO teams(id,name,format) VALUES(?,?,?)').bind(teamId,name,format),db.prepare("INSERT INTO team_members(team_id,user_id,role) VALUES(?,?,'owner')").bind(teamId,userId)]);
+     await db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'create_team',teamId).run();return json({ok:true,teamId})
+    }
+    if(b.op==='adminResetPassword'){
+     if(!valid(b.userId,100)||!valid(b.password,200)||b.password.length<10)return err('Password di almeno 10 caratteri');
+     let salt=token(),h=await hashPassword(b.password,salt);let r=await db.prepare('UPDATE users SET password_hash=?,salt=? WHERE id=?').bind(h,salt,b.userId).run();if(!r.meta.changes)return err('Account non trovato',404);
+     await db.prepare('DELETE FROM sessions WHERE user_id=?').bind(b.userId).run();await db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'reset_password',b.userId).run();return json({ok:true})
+    }
+    if(b.op==='adminSetTeamStatus'){
+     if(!valid(b.teamId,100)||typeof b.disabled!=='boolean')return err('Dati non validi');let t=await db.prepare('SELECT id FROM teams WHERE id=?').bind(b.teamId).first();if(!t)return err('Squadra non trovata',404);
+     if(b.disabled)await db.prepare('INSERT OR IGNORE INTO sf_disabled_teams(team_id) VALUES(?)').bind(b.teamId).run();else await db.prepare('DELETE FROM sf_disabled_teams WHERE team_id=?').bind(b.teamId).run();
+     await db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,b.disabled?'disable_team':'enable_team',b.teamId).run();return json({ok:true})
+    }
     if(b.op==='adminRevokeSessions'){
-     if(!valid(b.userId,100)||b.userId===adminUser.id)return err('Utente non valido o sessione ADMIN protetta');
+     if(!valid(b.userId,100))return err('Utente non valido o sessione ADMIN protetta');
      let found=await db.prepare('SELECT id FROM users WHERE id=?').bind(b.userId).first();if(!found)return err('Utente non trovato',404);
      await db.prepare('DELETE FROM sessions WHERE user_id=?').bind(b.userId).run();
      await db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'revoke_sessions',b.userId).run();return json({ok:true})
@@ -54,7 +93,7 @@ export async function onRequest({request,env}){
    return err('Metodo non consentito',405)
   }catch(e){console.error('Admin API',e);return err('ADMIN non configurato: esegui admin-migration.sql su D1.',503)}
  }
- if(request.method==='GET'&&p==='/api/me'){let u=await auth(db,request);if(!u)return json({user:null,teams:[]});let teams=await db.prepare('SELECT t.*,m.role FROM teams t JOIN team_members m ON t.id=m.team_id WHERE m.user_id=? ORDER BY t.created_at DESC').bind(u.id).all();return json({user:u,teams:teams.results,isAdmin:!!env.ADMIN_USER_ID&&u.id===env.ADMIN_USER_ID})}
+ if(request.method==='GET'&&p==='/api/me'){let u=await auth(db,request);if(!u)return json({user:null,teams:[]});let teams=await db.prepare('SELECT t.*,m.role FROM teams t JOIN team_members m ON t.id=m.team_id WHERE m.user_id=? ORDER BY t.created_at DESC').bind(u.id).all();return json({user:u,teams:teams.results,isAdmin:false})}
  if(request.method==='GET'&&p==='/api/team'){let u=await auth(db,request),id=url.searchParams.get('id');if(!await teamAuth(db,u,id))return err('Accesso non autorizzato',403);let [team,players,events,callups]=await Promise.all([db.prepare('SELECT * FROM teams WHERE id=?').bind(id).first(),db.prepare('SELECT id,name,number,role FROM players WHERE team_id=? ORDER BY name').bind(id).all(),db.prepare('SELECT * FROM events WHERE team_id=? ORDER BY starts_at DESC LIMIT 150').bind(id).all(),db.prepare('SELECT c.event_id,c.player_id,c.status FROM callups c JOIN events e ON e.id=c.event_id WHERE e.team_id=?').bind(id).all()]);let responses=await db.prepare('SELECT a.event_id,a.player_id,a.status FROM availability a JOIN events e ON e.id=a.event_id WHERE e.team_id=?').bind(id).all();return json({team,players:players.results,events:events.results,callups:callups.results,responses:responses.results})}
  if(request.method==='GET'&&p==='/api/player'){let t=url.searchParams.get('token');if(!t||!/^[a-f0-9]{64}$/.test(t))return err('Link non valido',403);let player=await db.prepare('SELECT p.id,p.name,p.team_id,t.name AS team_name FROM player_links l JOIN players p ON p.id=l.player_id JOIN teams t ON t.id=p.team_id WHERE l.token_hash=?').bind(await sha(t)).first();if(!player)return err('Link non valido o revocato',403);let events=await db.prepare("SELECT e.id,e.title,e.type,e.starts_at,e.venue,e.opponent,a.status AS my_status,c.status AS callup FROM events e LEFT JOIN availability a ON a.event_id=e.id AND a.player_id=? LEFT JOIN callups c ON c.event_id=e.id AND c.player_id=? WHERE e.team_id=? AND e.starts_at>=datetime('now','-1 day') ORDER BY e.starts_at LIMIT 40").bind(player.id,player.id,player.team_id).all();return json({player,events:events.results})}
  if(request.method!=='POST')return err('Metodo non consentito',405);
@@ -63,12 +102,13 @@ export async function onRequest({request,env}){
  let b;try{b=await readBody(request)}catch{return err('JSON non valido o troppo grande')}
  const op=b.op;
  try{
- if(op==='register'){let email=clean(b.email,254).toLowerCase(),pass=b.password;if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!valid(pass,200)||pass.length<10)return err('Inserisci email valida e password di almeno 10 caratteri');let salt=token(),h=await hashPassword(pass,salt),id=uid();try{await db.prepare('INSERT INTO users(id,email,password_hash,salt) VALUES(?,?,?,?)').bind(id,email,h,salt).run()}catch{return err('Email già registrata o database non configurato',409)}let t=token();await db.prepare("INSERT INTO sessions(id_hash,user_id,expires_at) VALUES(?,?,datetime('now','+30 days'))").bind(await sha(t),id).run();return json({ok:true},200, {'set-cookie':cookie(t,2592000)})}
+ if(op==='register')return err('Registrazione pubblica disabilitata: richiedi l’accesso all’amministratore',403);
  if(op==='login'){let email=clean(b.email,254).toLowerCase(),u=await db.prepare('SELECT * FROM users WHERE email=?').bind(email).first();if(!u||await hashPassword(b.password||'',u.salt)!==u.password_hash)return err('Credenziali non valide',401);let t=token();await db.prepare("INSERT INTO sessions(id_hash,user_id,expires_at) VALUES(?,?,datetime('now','+30 days'))").bind(await sha(t),u.id).run();return json({ok:true},200,{'set-cookie':cookie(t,2592000)})}
  if(op==='availability'){let t=b.token;if(typeof t!=='string'||!/^[a-f0-9]{64}$/.test(t)||!['yes','no','maybe'].includes(b.status))return err('Dati non validi');let row=await db.prepare('SELECT p.id,p.team_id FROM player_links l JOIN players p ON p.id=l.player_id WHERE l.token_hash=?').bind(await sha(t)).first();if(!row)return err('Link non valido',403);let ev=await db.prepare('SELECT id FROM events WHERE id=? AND team_id=?').bind(b.eventId,row.team_id).first();if(!ev)return err('Evento non trovato',404);await db.prepare("INSERT INTO availability(event_id,player_id,status,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(event_id,player_id) DO UPDATE SET status=excluded.status,updated_at=CURRENT_TIMESTAMP").bind(ev.id,row.id,b.status).run();return json({ok:true})}
  let u=await auth(db,request);if(!u)return err('Effettua il login',401);
  if(op==='logout'){let t=(request.headers.get('cookie')||'').match(/sf_session=([a-f0-9]{64})/)?.[1];if(t)await db.prepare('DELETE FROM sessions WHERE id_hash=?').bind(await sha(t)).run();return json({ok:true},200,{'set-cookie':cookie('',0)})}
- if(op==='createTeam'){if(!valid(b.name,100)||![5,7,11].includes(Number(b.format)))return err('Nome o formato non valido');let id=uid();await db.batch([db.prepare('INSERT INTO teams(id,name,format) VALUES(?,?,?)').bind(id,clean(b.name,100),Number(b.format)),db.prepare("INSERT INTO team_members(team_id,user_id,role) VALUES(?,?,'owner')").bind(id,u.id)]);return json({ok:true,id})}
+ if(op==='createTeam')return err('Solo ADMIN può creare squadre',403);
+ if(false&&op==='createTeam'){if(!valid(b.name,100)||![5,7,11].includes(Number(b.format)))return err('Nome o formato non valido');let id=uid();await db.batch([db.prepare('INSERT INTO teams(id,name,format) VALUES(?,?,?)').bind(id,clean(b.name,100),Number(b.format)),db.prepare("INSERT INTO team_members(team_id,user_id,role) VALUES(?,?,'owner')").bind(id,u.id)]);return json({ok:true,id})}
  let member=await teamAuth(db,u,b.teamId);if(!member)return err('Non hai accesso a questa squadra',403);
  if(op==='addPlayer'){if(!valid(b.name,100))return err('Inserisci il nome');let number=b.number===''||b.number==null?null:Number(b.number);if(number!==null&&(!Number.isInteger(number)||number<0||number>99))return err('Numero maglia non valido');let id=uid();await db.prepare('INSERT INTO players(id,team_id,name,number,role) VALUES(?,?,?,?,?)').bind(id,b.teamId,clean(b.name,100),number,clean(b.role,50)).run();return json({ok:true,id})}
  if(op==='deletePlayer'){let r=await db.prepare('DELETE FROM players WHERE id=? AND team_id=?').bind(b.playerId,b.teamId).run();return json({ok:r.meta.changes>0})}
