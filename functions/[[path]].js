@@ -81,16 +81,26 @@ export async function onRequest({request,env}){
      const existing=await db.prepare('SELECT id FROM users WHERE lower(email)=?').bind(email).first();
      if(existing)return err('Questa email è già associata a un account. Usane una diversa.',409);
      const userId=uid(),teamId=uid(),salt=token(),hash=await hashPassword(pass,salt);
-     const duration=plan==='annual'?'+365 days':plan==='monthly'?'+30 days':'+14 days';
+     const durationDays=plan==='annual'?365:plan==='monthly'?30:14;
+     const endsAt=new Date(Date.now()+durationDays*86400000).toISOString().slice(0,19).replace('T',' ');
      const status=plan==='trial'?'trial':'active';
-     // D1 batch is transactional: no orphan user or partial team on failure.
-     await db.batch([
-      db.prepare('INSERT INTO users(id,email,password_hash,salt) VALUES(?,?,?,?)').bind(userId,email,hash,salt),
-      db.prepare('INSERT INTO teams(id,name,format) VALUES(?,?,?)').bind(teamId,name,format),
-      db.prepare("INSERT INTO team_members(team_id,user_id,role) VALUES(?,?,'owner')").bind(teamId,userId),
-      db.prepare("INSERT INTO sf_subscriptions(team_id,plan,status,ends_at) VALUES(?,?,?,datetime('now',?))").bind(teamId,plan,status,duration),
-      db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'create_team',teamId)
-     ]);
+     // D1 batch is atomic. Do not let a nonessential audit insert block account creation.
+     try{
+      await db.batch([
+       db.prepare('INSERT INTO users(id,email,password_hash,salt) VALUES(?,?,?,?)').bind(userId,email,hash,salt),
+       db.prepare('INSERT INTO teams(id,name,format) VALUES(?,?,?)').bind(teamId,name,format),
+       db.prepare("INSERT INTO team_members(team_id,user_id,role) VALUES(?,?,'owner')").bind(teamId,userId),
+       db.prepare('INSERT INTO sf_subscriptions(team_id,plan,status,ends_at) VALUES(?,?,?,?)').bind(teamId,plan,status,endsAt)
+      ]);
+     }catch(e){
+      console.error('ADMIN_CREATE_TEAM_FAILED',e);
+      // Only an authenticated ADMIN can reach this branch. Surface the D1 failure
+      // to make a schema mismatch actionable instead of hiding it behind a generic 500.
+      const detail=String(e?.message||'Errore D1 sconosciuto').slice(0,450);
+      return json({error:'Creazione non riuscita nel database: '+detail,code:'ADMIN_CREATE_TEAM_DB'},500);
+     }
+     try{await db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'create_team',teamId).run()}
+     catch(e){console.error('ADMIN_AUDIT_FAILED',e)}
      const saved=await db.prepare('SELECT t.id,t.name,t.format,u.email FROM teams t JOIN team_members m ON m.team_id=t.id JOIN users u ON u.id=m.user_id WHERE t.id=? AND u.id=?').bind(teamId,userId).first();
      if(!saved)return err('La squadra non risulta salvata: riprova o contatta assistenza',500);
      return json({ok:true,team:saved,teamId,userId});
@@ -142,7 +152,7 @@ export async function onRequest({request,env}){
     return err('Operazione ADMIN sconosciuta',404)
    }
    return err('Metodo non consentito',405)
-  }catch(e){console.error('Admin API',e);return err('Salvataggio non riuscito sul database. Nessuna squadra creata. Controlla il log Cloudflare.',500)}
+  }catch(e){console.error('Admin API',e);return err('Operazione ADMIN non completata: '+String(e?.message||'errore database').slice(0,350),500)}
  }
  if(request.method==='GET'&&p==='/api/me'){let u=await auth(db,request);if(!u)return json({user:null,teams:[]});if(await db.prepare('SELECT 1 FROM sf_disabled_users WHERE user_id=?').bind(u.id).first())return json({user:null,teams:[]});let teams=await db.prepare("SELECT t.*,m.role FROM teams t JOIN team_members m ON t.id=m.team_id WHERE m.user_id=? AND NOT EXISTS (SELECT 1 FROM sf_disabled_teams d WHERE d.team_id=t.id) AND NOT EXISTS (SELECT 1 FROM sf_subscriptions s WHERE s.team_id=t.id AND (s.status IN ('expired','cancelled','past_due') OR (s.ends_at IS NOT NULL AND substr(s.ends_at,1,10)<date('now')))) ORDER BY t.created_at DESC").bind(u.id).all();return json({user:u,teams:teams.results,isAdmin:false})}
  if(request.method==='GET'&&p==='/api/team'){let u=await auth(db,request),id=url.searchParams.get('id');if(!await teamAuth(db,u,id))return err('Accesso non autorizzato',403);let [team,players,events,callups]=await Promise.all([db.prepare('SELECT * FROM teams WHERE id=?').bind(id).first(),db.prepare('SELECT id,name,number,role FROM players WHERE team_id=? ORDER BY name').bind(id).all(),db.prepare('SELECT * FROM events WHERE team_id=? ORDER BY starts_at DESC LIMIT 150').bind(id).all(),db.prepare('SELECT c.event_id,c.player_id,c.status FROM callups c JOIN events e ON e.id=c.event_id WHERE e.team_id=?').bind(id).all()]);let responses=await db.prepare('SELECT a.event_id,a.player_id,a.status FROM availability a JOIN events e ON e.id=a.event_id WHERE e.team_id=?').bind(id).all();return json({team,players:players.results,events:events.results,callups:callups.results,responses:responses.results})}
