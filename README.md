@@ -1,23 +1,32 @@
-# SquadraFacile — versione semplificata (2 cartelle)
+# SquadraFacile 2.0 — Cloudflare Pages
 
-Questa è la **base pubblicabile** di SquadraFacile, non ancora il gestionale completo.
+**Due cartelle soltanto:** `public/` (interfaccia) e `functions/` (API Pages Functions). I file `schema.sql`, `wrangler.toml` e `package.json` sono nella radice.
 
-## Struttura
+## Installazione su Cloudflare
 
-- `public/` — sito web e manifest.
-- `functions/` — API Cloudflare Pages (`GET /api`).
-- `schema.sql` — database D1, nella radice.
-- `wrangler.toml` — configurazione Cloudflare.
-- `package.json` — comandi opzionali.
+1. Carica il contenuto di questo ZIP **nella radice del repository GitHub esistente**, sostituendo i file precedenti. Elimina `functions/api.js` del vecchio starter: è sostituito da `functions/[[path]].js`.
+2. Mantieni il progetto Cloudflare Pages esistente e la directory di output `public`. Framework preset: None; build command: vuoto.
+3. In Cloudflare > D1 crea `squadrafacile-db` se non esiste già.
+4. Nelle impostazioni di Pages > Bindings aggiungi **D1 database**, nome variabile `DB`, scegli il database. Impostalo sia per Production sia per Preview se usi le anteprime.
+5. Cloudflare > D1 > database > Console: esegui il contenuto di `schema.sql` sul database **remoto**. Le istruzioni `CREATE TABLE IF NOT EXISTS` mantengono i dati già presenti nello starter.
+6. Esegui un nuovo deploy di Pages, poi verifica `https://TUO-DOMINIO.pages.dev/api/status` che deve restituire `{ "ok": true }`.
 
-## Pubblicazione GitHub + Cloudflare Pages
+Se usi Wrangler con GitHub, aggiorna `database_id` nel `wrangler.toml` con l'ID vero del tuo database; **non** lasciare `INSERISCI_DATABASE_ID` per deploy gestiti da Wrangler. Se configuri tutto dal dashboard Cloudflare, usa il binding `DB` lì.
 
-1. Estrai lo ZIP e carica **il contenuto**, non la cartella esterna, nella radice del repository GitHub `SquadraFacile`.
-2. In Cloudflare crea il database D1 `squadrafacile-db`.
-3. Sostituisci `INSERISCI_DATABASE_ID` in `wrangler.toml` con l'ID reale del database.
-4. In Cloudflare Pages, collega il repository GitHub e imposta: **Framework None**, **Build command vuoto**, **Build output directory `public`**, **Root `/`**.
-5. In Pages > Settings > Bindings collega D1 con il nome **DB** al database creato (per Production e, se serve, Preview), poi ridistribuisci.
-6. In D1 > Console incolla ed esegui `schema.sql` oppure usa `npx wrangler d1 execute squadrafacile-db --remote --file=./schema.sql` dopo aver effettuato il login a Cloudflare.
-7. Visita `https://TUO-SITO.pages.dev/api`: con binding configurato dovrebbe restituire `{"status":"ok","database":"connected"}`.
+## Funzionalità incluse
 
-**Nota:** la pagina iniziale è una landing. Non sono ancora attivi login, gestione rosa, convocazioni, importazione calendari o Stripe. Lo schema dati è preparatorio: prima di creare API di scrittura servono autenticazione e controlli dei permessi.
+- Registrazione e accesso con password PBKDF2 e cookie di sessione HttpOnly.
+- Creazione squadre calcio a 5, 7 e 11; dati separati per squadra.
+- Gestione rosa (aggiunta/eliminazione) e calendario manuale (creazione/eliminazione).
+- Link personali generati dal dirigente: la generazione di un nuovo link revoca quello precedente. Il dirigente deve condividerlo subito, perché il token non viene conservato in chiaro.
+- Disponibilità del giocatore tramite link senza login.
+- Convocazioni e condivisione via WhatsApp.
+- Dati persistenti in D1; autorizzazione server-side per squadra.
+
+## Non ancora inclusi
+
+Importazione e sincronizzazione dei calendari LND, modifica dei giocatori, cassa, statistiche, Stripe, amministrazione centrale, recupero password e protezioni avanzate anti-abuso. **Non attivare ancora abbonamenti a pagamento.** Prima di un lancio pubblico aggiungere rate limiting su login/registrazione, reset password, log di sicurezza, privacy e termini, test approfonditi e procedure di backup.
+
+## Nota sicurezza
+
+Le API usano cookie `Secure`, quindi il login funziona su HTTPS (Cloudflare Pages). I link dei giocatori sono credenziali personali: se condivisi impropriamente, chi li possiede può rispondere a nome del giocatore. Per revocare un link basta generarne uno nuovo.

@@ -1,24 +1,13 @@
-PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS teams (
- id TEXT PRIMARY KEY, name TEXT NOT NULL, format INTEGER NOT NULL CHECK(format IN (5,7,11)), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS players (
- id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
- name TEXT NOT NULL, number INTEGER, role TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS teams (id TEXT PRIMARY KEY,name TEXT NOT NULL,format INTEGER NOT NULL CHECK(format IN (5,7,11)),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS players (id TEXT PRIMARY KEY,team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,name TEXT NOT NULL,number INTEGER,role TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id);
-CREATE TABLE IF NOT EXISTS events (
- id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
- type TEXT NOT NULL CHECK(type IN ('training','match','other')),
- title TEXT NOT NULL, starts_at TEXT NOT NULL, venue TEXT, opponent TEXT,
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_events_team_date ON events(team_id, starts_at);
-CREATE TABLE IF NOT EXISTS availability (
- event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
- player_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
- status TEXT NOT NULL CHECK(status IN ('yes','no','maybe')),
- updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- PRIMARY KEY(event_id,player_id)
-);
--- Prima di esporre API di scrittura aggiungere autenticazione, autorizzazione per squadra e token personali dei giocatori.
+CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY,team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,type TEXT NOT NULL CHECK(type IN ('training','match','other')),title TEXT NOT NULL,starts_at TEXT NOT NULL,venue TEXT,opponent TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_events_team_date ON events(team_id,starts_at);
+CREATE TABLE IF NOT EXISTS availability (event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,player_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,status TEXT NOT NULL CHECK(status IN ('yes','no','maybe')),updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(event_id,player_id));
+CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,salt TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS sessions (id_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS team_members (team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,role TEXT NOT NULL CHECK(role IN ('owner','coach','manager')),PRIMARY KEY(team_id,user_id));
+CREATE TABLE IF NOT EXISTS player_links (player_id TEXT PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,token_hash TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS callups (event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,player_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,status TEXT NOT NULL CHECK(status IN ('called','reserve')),PRIMARY KEY(event_id,player_id));
