@@ -4,7 +4,7 @@ const uid=()=>crypto.randomUUID();
 const token=()=>{let b=new Uint8Array(32);crypto.getRandomValues(b);return Array.from(b,x=>x.toString(16).padStart(2,'0')).join('')};
 const sha=async s=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s))),x=>x.toString(16).padStart(2,'0')).join('');
 const hex=a=>Array.from(a,x=>x.toString(16).padStart(2,'0')).join('');
-async function hashPassword(pass,salt){let k=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveBits']);return hex(new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2',salt:new TextEncoder().encode(salt),iterations:210000,hash:'SHA-256'},k,256)))}
+async function hashPassword(pass,salt){let k=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveBits']);return hex(new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2',salt:new TextEncoder().encode(salt),iterations:100000,hash:'SHA-256'},k,256)))}
 const valid=(v,n=150)=>typeof v==='string'&&v.trim().length>0&&v.trim().length<=n;
 const clean=(v,n=150)=>typeof v==='string'?v.trim().slice(0,n):'';
 async function auth(db,request){let c=request.headers.get('cookie')||'';let t=c.match(/(?:^|;\s*)sf_session=([a-f0-9]{64})(?:;|$)/)?.[1];if(!t)return null;return db.prepare("SELECT users.id,users.email FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.id_hash=? AND sessions.expires_at>datetime('now') AND NOT EXISTS (SELECT 1 FROM sf_disabled_users du WHERE du.user_id=users.id)").bind(await sha(t)).first()}
