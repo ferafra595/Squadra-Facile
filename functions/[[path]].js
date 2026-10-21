@@ -10,7 +10,7 @@ const clean=(v,n=150)=>typeof v==='string'?v.trim().slice(0,n):'';
 async function auth(db,request){let c=request.headers.get('cookie')||'';let t=c.match(/(?:^|;\s*)sf_session=([a-f0-9]{64})(?:;|$)/)?.[1];if(!t)return null;return db.prepare("SELECT users.id,users.email FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.id_hash=? AND sessions.expires_at>datetime('now') AND NOT EXISTS (SELECT 1 FROM sf_disabled_users du WHERE du.user_id=users.id)").bind(await sha(t)).first()}
 const adminCookie=(t,maxAge)=>`sf_admin=${t}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
 const cookie=(t,maxAge)=>`sf_session=${t}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
-async function teamAuth(db,user,teamId){if(!user||!teamId)return null;let disabled=await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(teamId).first();if(disabled)return null;let banned=await db.prepare('SELECT 1 FROM sf_disabled_users WHERE user_id=?').bind(user.id).first();if(banned)return null;return db.prepare('SELECT role FROM team_members WHERE team_id=? AND user_id=?').bind(teamId,user.id).first()}
+async function teamAuth(db,user,teamId){if(!user||!teamId)return null;let disabled=await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(teamId).first();if(disabled)return null;let banned=await db.prepare('SELECT 1 FROM sf_disabled_users WHERE user_id=?').bind(user.id).first();if(banned)return null;let sub=await db.prepare('SELECT status,ends_at FROM sf_subscriptions WHERE team_id=?').bind(teamId).first();if(sub&&(sub.status==='expired'||sub.status==='cancelled'||sub.status==='past_due'||(sub.ends_at&&sub.ends_at.slice(0,10)<new Date().toISOString().slice(0,10))))return null;return db.prepare('SELECT role FROM team_members WHERE team_id=? AND user_id=?').bind(teamId,user.id).first()}
 async function readBody(req){let len=Number(req.headers.get('content-length')||0);if(len>16000)throw Error('Richiesta troppo grande');return req.json()}
 export async function onRequest({request,env}){
  const url=new URL(request.url),p=url.pathname;
@@ -19,7 +19,7 @@ export async function onRequest({request,env}){
  const db=env.DB;
  // Ensure ADMIN-only tables exist before checking sessions or accepting login.
  // This makes first-time setup safe without a manual D1 migration.
- if(p.startsWith('/api/admin')){
+ {
   try{
    await db.batch([
     db.prepare('CREATE TABLE IF NOT EXISTS sf_admin_sessions (id_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL)'),
@@ -72,13 +72,28 @@ export async function onRequest({request,env}){
     const origin=request.headers.get('origin');if(origin&&origin!==url.origin)return err('Origine non autorizzata',403);
     let b;try{b=await readBody(request)}catch{return err('JSON non valido')}
     if(b.op==='adminCreateTeam'){
-     let email=clean(b.email,254).toLowerCase(),pass=b.password,name=clean(b.name,100),format=Number(b.format);
-     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!valid(pass,200)||pass.length<10||!name||![5,7,11].includes(format))return err('Inserisci squadra, formato, email e password di almeno 10 caratteri');
-     let user=await db.prepare('SELECT id FROM users WHERE email=?').bind(email).first();let userId=user?.id||uid(),teamId=uid();
-     if(!user){let salt=token(),h=await hashPassword(pass,salt);await db.prepare('INSERT INTO users(id,email,password_hash,salt) VALUES(?,?,?,?)').bind(userId,email,h,salt).run()}
-     else return err('Email già presente: utilizza un indirizzo diverso',409);
-     await db.batch([db.prepare('INSERT INTO teams(id,name,format) VALUES(?,?,?)').bind(teamId,name,format),db.prepare("INSERT INTO team_members(team_id,user_id,role) VALUES(?,?,'owner')").bind(teamId,userId),db.prepare("INSERT INTO sf_subscriptions(team_id,plan,status,ends_at) VALUES(?,'trial','trial',datetime('now','+14 days'))").bind(teamId)]);
-     await db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'create_team',teamId).run();return json({ok:true,teamId})
+     const email=clean(b.email,254).toLowerCase(),pass=String(b.password||''),name=clean(b.name,100),format=Number(b.format);
+     const plan=['trial','monthly','annual'].includes(b.plan)?b.plan:'trial';
+     if(!name)return err('Inserisci il nome della squadra');
+     if(![5,7,11].includes(format))return err('Seleziona calcio a 5, 7 oppure 11');
+     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return err('Inserisci una email valida');
+     if(pass.length<10||pass.length>200)return err('La password deve avere almeno 10 caratteri');
+     const existing=await db.prepare('SELECT id FROM users WHERE lower(email)=?').bind(email).first();
+     if(existing)return err('Questa email è già associata a un account. Usane una diversa.',409);
+     const userId=uid(),teamId=uid(),salt=token(),hash=await hashPassword(pass,salt);
+     const duration=plan==='annual'?'+365 days':plan==='monthly'?'+30 days':'+14 days';
+     const status=plan==='trial'?'trial':'active';
+     // D1 batch is transactional: no orphan user or partial team on failure.
+     await db.batch([
+      db.prepare('INSERT INTO users(id,email,password_hash,salt) VALUES(?,?,?,?)').bind(userId,email,hash,salt),
+      db.prepare('INSERT INTO teams(id,name,format) VALUES(?,?,?)').bind(teamId,name,format),
+      db.prepare("INSERT INTO team_members(team_id,user_id,role) VALUES(?,?,'owner')").bind(teamId,userId),
+      db.prepare("INSERT INTO sf_subscriptions(team_id,plan,status,ends_at) VALUES(?,?,?,datetime('now',?))").bind(teamId,plan,status,duration),
+      db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'create_team',teamId)
+     ]);
+     const saved=await db.prepare('SELECT t.id,t.name,t.format,u.email FROM teams t JOIN team_members m ON m.team_id=t.id JOIN users u ON u.id=m.user_id WHERE t.id=? AND u.id=?').bind(teamId,userId).first();
+     if(!saved)return err('La squadra non risulta salvata: riprova o contatta assistenza',500);
+     return json({ok:true,team:saved,teamId,userId});
     }
     if(b.op==='adminSubscription'){
      if(!valid(b.teamId,100)||!['trial','monthly','annual','custom'].includes(b.plan)||!['trial','active','past_due','expired','cancelled'].includes(b.status))return err('Piano o stato non valido');
@@ -127,11 +142,11 @@ export async function onRequest({request,env}){
     return err('Operazione ADMIN sconosciuta',404)
    }
    return err('Metodo non consentito',405)
-  }catch(e){console.error('Admin API',e);return err('ADMIN non configurato: esegui admin-migration.sql su D1.',503)}
+  }catch(e){console.error('Admin API',e);return err('Salvataggio non riuscito sul database. Nessuna squadra creata. Controlla il log Cloudflare.',500)}
  }
- if(request.method==='GET'&&p==='/api/me'){let u=await auth(db,request);if(!u)return json({user:null,teams:[]});if(await db.prepare('SELECT 1 FROM sf_disabled_users WHERE user_id=?').bind(u.id).first())return json({user:null,teams:[]});let teams=await db.prepare('SELECT t.*,m.role FROM teams t JOIN team_members m ON t.id=m.team_id WHERE m.user_id=? AND NOT EXISTS (SELECT 1 FROM sf_disabled_teams d WHERE d.team_id=t.id) ORDER BY t.created_at DESC').bind(u.id).all();return json({user:u,teams:teams.results,isAdmin:false})}
+ if(request.method==='GET'&&p==='/api/me'){let u=await auth(db,request);if(!u)return json({user:null,teams:[]});if(await db.prepare('SELECT 1 FROM sf_disabled_users WHERE user_id=?').bind(u.id).first())return json({user:null,teams:[]});let teams=await db.prepare('SELECT t.*,m.role FROM teams t JOIN team_members m ON t.id=m.team_id WHERE m.user_id=? AND NOT EXISTS (SELECT 1 FROM sf_disabled_teams d WHERE d.team_id=t.id) AND NOT EXISTS (SELECT 1 FROM sf_subscriptions s WHERE s.team_id=t.id AND (s.status IN ('expired','cancelled','past_due') OR (s.ends_at IS NOT NULL AND substr(s.ends_at,1,10)<date('now')))) ORDER BY t.created_at DESC').bind(u.id).all();return json({user:u,teams:teams.results,isAdmin:false})}
  if(request.method==='GET'&&p==='/api/team'){let u=await auth(db,request),id=url.searchParams.get('id');if(!await teamAuth(db,u,id))return err('Accesso non autorizzato',403);let [team,players,events,callups]=await Promise.all([db.prepare('SELECT * FROM teams WHERE id=?').bind(id).first(),db.prepare('SELECT id,name,number,role FROM players WHERE team_id=? ORDER BY name').bind(id).all(),db.prepare('SELECT * FROM events WHERE team_id=? ORDER BY starts_at DESC LIMIT 150').bind(id).all(),db.prepare('SELECT c.event_id,c.player_id,c.status FROM callups c JOIN events e ON e.id=c.event_id WHERE e.team_id=?').bind(id).all()]);let responses=await db.prepare('SELECT a.event_id,a.player_id,a.status FROM availability a JOIN events e ON e.id=a.event_id WHERE e.team_id=?').bind(id).all();return json({team,players:players.results,events:events.results,callups:callups.results,responses:responses.results})}
- if(request.method==='GET'&&p==='/api/player'){let t=url.searchParams.get('token');if(!t||!/^[a-f0-9]{64}$/.test(t))return err('Link non valido',403);let player=await db.prepare('SELECT p.id,p.name,p.team_id,t.name AS team_name FROM player_links l JOIN players p ON p.id=l.player_id JOIN teams t ON t.id=p.team_id WHERE l.token_hash=?').bind(await sha(t)).first();if(!player)return err('Link non valido o revocato',403);if(await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(player.team_id).first())return err('Squadra sospesa',403);let events=await db.prepare("SELECT e.id,e.title,e.type,e.starts_at,e.venue,e.opponent,a.status AS my_status,c.status AS callup FROM events e LEFT JOIN availability a ON a.event_id=e.id AND a.player_id=? LEFT JOIN callups c ON c.event_id=e.id AND c.player_id=? WHERE e.team_id=? AND e.starts_at>=datetime('now','-1 day') ORDER BY e.starts_at LIMIT 40").bind(player.id,player.id,player.team_id).all();return json({player,events:events.results})}
+ if(request.method==='GET'&&p==='/api/player'){let t=url.searchParams.get('token');if(!t||!/^[a-f0-9]{64}$/.test(t))return err('Link non valido',403);let player=await db.prepare('SELECT p.id,p.name,p.team_id,t.name AS team_name FROM player_links l JOIN players p ON p.id=l.player_id JOIN teams t ON t.id=p.team_id WHERE l.token_hash=?').bind(await sha(t)).first();if(!player)return err('Link non valido o revocato',403);if(await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(player.team_id).first())return err('Squadra sospesa',403);let ps=await db.prepare('SELECT status,ends_at FROM sf_subscriptions WHERE team_id=?').bind(player.team_id).first();if(ps&&( ['expired','cancelled','past_due'].includes(ps.status)||(ps.ends_at&&ps.ends_at.slice(0,10)<new Date().toISOString().slice(0,10))))return err('Abbonamento squadra non attivo',403);let events=await db.prepare("SELECT e.id,e.title,e.type,e.starts_at,e.venue,e.opponent,a.status AS my_status,c.status AS callup FROM events e LEFT JOIN availability a ON a.event_id=e.id AND a.player_id=? LEFT JOIN callups c ON c.event_id=e.id AND c.player_id=? WHERE e.team_id=? AND e.starts_at>=datetime('now','-1 day') ORDER BY e.starts_at LIMIT 40").bind(player.id,player.id,player.team_id).all();return json({player,events:events.results})}
  if(request.method!=='POST')return err('Metodo non consentito',405);
  if(!request.headers.get('content-type')?.startsWith('application/json'))return err('Invia JSON',415);
  const origin=request.headers.get('origin');if(origin&&origin!==url.origin)return err('Origine non autorizzata',403);
@@ -140,7 +155,7 @@ export async function onRequest({request,env}){
  try{
  if(op==='register')return err('Registrazione pubblica disabilitata: richiedi l’accesso all’amministratore',403);
  if(op==='login'){let email=clean(b.email,254).toLowerCase(),u=await db.prepare('SELECT * FROM users WHERE email=?').bind(email).first();if(!u||await hashPassword(b.password||'',u.salt)!==u.password_hash)return err('Credenziali non valide',401);if(await db.prepare('SELECT 1 FROM sf_disabled_users WHERE user_id=?').bind(u.id).first())return err('Account disattivato. Contatta ADMIN',403);let active=await db.prepare('SELECT 1 FROM team_members m LEFT JOIN sf_disabled_teams d ON d.team_id=m.team_id WHERE m.user_id=? AND d.team_id IS NULL LIMIT 1').bind(u.id).first();if(!active)return err('Nessuna squadra attiva assegnata',403);let t=token();await db.prepare("INSERT INTO sessions(id_hash,user_id,expires_at) VALUES(?,?,datetime('now','+30 days'))").bind(await sha(t),u.id).run();return json({ok:true},200,{'set-cookie':cookie(t,2592000)})}
- if(op==='availability'){let t=b.token;if(typeof t!=='string'||!/^[a-f0-9]{64}$/.test(t)||!['yes','no','maybe'].includes(b.status))return err('Dati non validi');let row=await db.prepare('SELECT p.id,p.team_id FROM player_links l JOIN players p ON p.id=l.player_id WHERE l.token_hash=?').bind(await sha(t)).first();if(!row)return err('Link non valido',403);if(await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(row.team_id).first())return err('Squadra sospesa',403);let ev=await db.prepare('SELECT id FROM events WHERE id=? AND team_id=?').bind(b.eventId,row.team_id).first();if(!ev)return err('Evento non trovato',404);await db.prepare("INSERT INTO availability(event_id,player_id,status,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(event_id,player_id) DO UPDATE SET status=excluded.status,updated_at=CURRENT_TIMESTAMP").bind(ev.id,row.id,b.status).run();return json({ok:true})}
+ if(op==='availability'){let t=b.token;if(typeof t!=='string'||!/^[a-f0-9]{64}$/.test(t)||!['yes','no','maybe'].includes(b.status))return err('Dati non validi');let row=await db.prepare('SELECT p.id,p.team_id FROM player_links l JOIN players p ON p.id=l.player_id WHERE l.token_hash=?').bind(await sha(t)).first();if(!row)return err('Link non valido',403);if(await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(row.team_id).first())return err('Squadra sospesa',403);let asub=await db.prepare('SELECT status,ends_at FROM sf_subscriptions WHERE team_id=?').bind(row.team_id).first();if(asub&&(['expired','cancelled','past_due'].includes(asub.status)||(asub.ends_at&&asub.ends_at.slice(0,10)<new Date().toISOString().slice(0,10))))return err('Abbonamento squadra non attivo',403);let ev=await db.prepare('SELECT id FROM events WHERE id=? AND team_id=?').bind(b.eventId,row.team_id).first();if(!ev)return err('Evento non trovato',404);await db.prepare("INSERT INTO availability(event_id,player_id,status,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(event_id,player_id) DO UPDATE SET status=excluded.status,updated_at=CURRENT_TIMESTAMP").bind(ev.id,row.id,b.status).run();return json({ok:true})}
  let u=await auth(db,request);if(!u)return err('Effettua il login',401);
  if(op==='logout'){let t=(request.headers.get('cookie')||'').match(/sf_session=([a-f0-9]{64})/)?.[1];if(t)await db.prepare('DELETE FROM sessions WHERE id_hash=?').bind(await sha(t)).run();return json({ok:true},200,{'set-cookie':cookie('',0)})}
  if(op==='createTeam')return err('Solo ADMIN può creare squadre',403);
