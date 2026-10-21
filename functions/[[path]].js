@@ -17,7 +17,43 @@ export async function onRequest({request,env}){
  if(!env.DB)return err('Database D1 non collegato: aggiungi il binding DB su Cloudflare Pages.',503);
  const db=env.DB;
  if(request.method==='GET'&&p==='/api/status'){try{await db.prepare('SELECT id FROM users LIMIT 1').first();return json({ok:true})}catch{return err('Schema non applicato. Esegui schema.sql nel database D1.',503)}}
- if(request.method==='GET'&&p==='/api/admin'){let u=await auth(db,request);if(!u||!env.ADMIN_USER_ID||u.id!==env.ADMIN_USER_ID)return err('Accesso ADMIN non autorizzato',403);let [users,teams,players,events,recent]=await Promise.all([db.prepare('SELECT COUNT(*) AS n FROM users').first(),db.prepare('SELECT COUNT(*) AS n FROM teams').first(),db.prepare('SELECT COUNT(*) AS n FROM players').first(),db.prepare('SELECT COUNT(*) AS n FROM events').first(),db.prepare('SELECT t.id,t.name,t.format,t.created_at,COUNT(DISTINCT p.id) AS players,COUNT(DISTINCT e.id) AS events FROM teams t LEFT JOIN players p ON p.team_id=t.id LEFT JOIN events e ON e.team_id=t.id GROUP BY t.id ORDER BY t.created_at DESC LIMIT 100').all()]);return json({stats:{users:users.n,teams:teams.n,players:players.n,events:events.n},teams:recent.results})}
+ const adminUser=await auth(db,request);
+ const isAdmin=!!adminUser&&!!env.ADMIN_USER_ID&&adminUser.id===env.ADMIN_USER_ID;
+ if(p.startsWith('/api/admin')){
+  if(!isAdmin)return err('Accesso ADMIN non autorizzato',403);
+  try{
+   if(request.method==='GET'&&p==='/api/admin'){
+    const [users,teams,players,events,teamRows,userRows,logs]=await Promise.all([
+     db.prepare('SELECT COUNT(*) n FROM users').first(),db.prepare('SELECT COUNT(*) n FROM teams').first(),db.prepare('SELECT COUNT(*) n FROM players').first(),db.prepare('SELECT COUNT(*) n FROM events').first(),
+     db.prepare(`SELECT t.id,t.name,t.format,t.created_at,COUNT(DISTINCT p.id) players,COUNT(DISTINCT e.id) events,GROUP_CONCAT(DISTINCT u.email) owners FROM teams t LEFT JOIN players p ON p.team_id=t.id LEFT JOIN events e ON e.team_id=t.id LEFT JOIN team_members m ON m.team_id=t.id AND m.role='owner' LEFT JOIN users u ON u.id=m.user_id GROUP BY t.id ORDER BY t.created_at DESC LIMIT 500`).all(),
+     db.prepare(`SELECT u.id,u.email,u.created_at,COUNT(DISTINCT m.team_id) teams FROM users u LEFT JOIN team_members m ON m.user_id=u.id GROUP BY u.id ORDER BY u.created_at DESC LIMIT 500`).all(),
+     db.prepare('SELECT actor_email,action,target,created_at FROM admin_audit ORDER BY created_at DESC LIMIT 100').all()]);
+    return json({stats:{users:users.n,teams:teams.n,players:players.n,events:events.n},teams:teamRows.results,users:userRows.results,logs:logs.results,subscriptions:{status:'not_connected',message:'Stripe non collegato: nessun ricavo o abbonamento verificato'}})
+   }
+   if(request.method==='GET'&&p==='/api/admin/team'){
+    let id=url.searchParams.get('id');if(!id)return err('Squadra mancante');let team=await db.prepare('SELECT * FROM teams WHERE id=?').bind(id).first();if(!team)return err('Squadra non trovata',404);
+    let [members,players,events]=await Promise.all([db.prepare('SELECT m.role,u.email,u.id FROM team_members m JOIN users u ON u.id=m.user_id WHERE m.team_id=?').bind(id).all(),db.prepare('SELECT id,name,number,role FROM players WHERE team_id=? ORDER BY name').bind(id).all(),db.prepare('SELECT id,title,type,starts_at FROM events WHERE team_id=? ORDER BY starts_at DESC LIMIT 100').bind(id).all()]);return json({team,members:members.results,players:players.results,events:events.results})
+   }
+   if(request.method==='POST'){
+    if(!request.headers.get('content-type')?.startsWith('application/json'))return err('Invia JSON',415);
+    const origin=request.headers.get('origin');if(origin&&origin!==url.origin)return err('Origine non autorizzata',403);
+    let b;try{b=await readBody(request)}catch{return err('JSON non valido')}
+    if(b.op==='adminRevokeSessions'){
+     if(!valid(b.userId,100)||b.userId===adminUser.id)return err('Utente non valido o sessione ADMIN protetta');
+     let found=await db.prepare('SELECT id FROM users WHERE id=?').bind(b.userId).first();if(!found)return err('Utente non trovato',404);
+     await db.prepare('DELETE FROM sessions WHERE user_id=?').bind(b.userId).run();
+     await db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'revoke_sessions',b.userId).run();return json({ok:true})
+    }
+    if(b.op==='adminRenameTeam'){
+     if(!valid(b.teamId,100)||!valid(b.name,100))return err('Dati non validi');
+     let r=await db.prepare('UPDATE teams SET name=? WHERE id=?').bind(clean(b.name,100),b.teamId).run();if(!r.meta.changes)return err('Squadra non trovata',404);
+     await db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'rename_team',b.teamId).run();return json({ok:true})
+    }
+    return err('Operazione ADMIN sconosciuta',404)
+   }
+   return err('Metodo non consentito',405)
+  }catch(e){console.error('Admin API',e);return err('ADMIN non configurato: esegui admin-migration.sql su D1.',503)}
+ }
  if(request.method==='GET'&&p==='/api/me'){let u=await auth(db,request);if(!u)return json({user:null,teams:[]});let teams=await db.prepare('SELECT t.*,m.role FROM teams t JOIN team_members m ON t.id=m.team_id WHERE m.user_id=? ORDER BY t.created_at DESC').bind(u.id).all();return json({user:u,teams:teams.results,isAdmin:!!env.ADMIN_USER_ID&&u.id===env.ADMIN_USER_ID})}
  if(request.method==='GET'&&p==='/api/team'){let u=await auth(db,request),id=url.searchParams.get('id');if(!await teamAuth(db,u,id))return err('Accesso non autorizzato',403);let [team,players,events,callups]=await Promise.all([db.prepare('SELECT * FROM teams WHERE id=?').bind(id).first(),db.prepare('SELECT id,name,number,role FROM players WHERE team_id=? ORDER BY name').bind(id).all(),db.prepare('SELECT * FROM events WHERE team_id=? ORDER BY starts_at DESC LIMIT 150').bind(id).all(),db.prepare('SELECT c.event_id,c.player_id,c.status FROM callups c JOIN events e ON e.id=c.event_id WHERE e.team_id=?').bind(id).all()]);let responses=await db.prepare('SELECT a.event_id,a.player_id,a.status FROM availability a JOIN events e ON e.id=a.event_id WHERE e.team_id=?').bind(id).all();return json({team,players:players.results,events:events.results,callups:callups.results,responses:responses.results})}
  if(request.method==='GET'&&p==='/api/player'){let t=url.searchParams.get('token');if(!t||!/^[a-f0-9]{64}$/.test(t))return err('Link non valido',403);let player=await db.prepare('SELECT p.id,p.name,p.team_id,t.name AS team_name FROM player_links l JOIN players p ON p.id=l.player_id JOIN teams t ON t.id=p.team_id WHERE l.token_hash=?').bind(await sha(t)).first();if(!player)return err('Link non valido o revocato',403);let events=await db.prepare("SELECT e.id,e.title,e.type,e.starts_at,e.venue,e.opponent,a.status AS my_status,c.status AS callup FROM events e LEFT JOIN availability a ON a.event_id=e.id AND a.player_id=? LEFT JOIN callups c ON c.event_id=e.id AND c.player_id=? WHERE e.team_id=? AND e.starts_at>=datetime('now','-1 day') ORDER BY e.starts_at LIMIT 40").bind(player.id,player.id,player.team_id).all();return json({player,events:events.results})}
