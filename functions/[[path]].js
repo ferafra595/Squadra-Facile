@@ -30,6 +30,15 @@ export async function onRequest({request,env}){
    ]);
   }catch(e){console.error('ADMIN schema initialization failed',e);return err('Impossibile inizializzare le tabelle ADMIN. Controlla il collegamento DB.',503)}
  }
+ // Moduli stagione: migrazione non distruttiva, idempotente.
+ try {await db.batch([
+ db.prepare('CREATE TABLE IF NOT EXISTS sf_event_links (event_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, created_at TEXT DEFAULT CURRENT_TIMESTAMP)'),
+ db.prepare('CREATE TABLE IF NOT EXISTS sf_tactics (id TEXT PRIMARY KEY, team_id TEXT NOT NULL, title TEXT NOT NULL, formation TEXT NOT NULL, phase TEXT NOT NULL, positions TEXT NOT NULL, notes TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)'),
+ db.prepare('CREATE TABLE IF NOT EXISTS sf_progress (id TEXT PRIMARY KEY, team_id TEXT NOT NULL, player_id TEXT, recorded_at TEXT NOT NULL, category TEXT NOT NULL, score INTEGER NOT NULL, strengths TEXT NOT NULL, improvements TEXT NOT NULL, action_plan TEXT NOT NULL)'),
+ db.prepare('CREATE TABLE IF NOT EXISTS sf_finances (id TEXT PRIMARY KEY, team_id TEXT NOT NULL, player_id TEXT, kind TEXT NOT NULL, amount_cents INTEGER NOT NULL, title TEXT NOT NULL, occurred_at TEXT NOT NULL, notes TEXT NOT NULL)'),
+ db.prepare('CREATE TABLE IF NOT EXISTS sf_fixtures (id TEXT PRIMARY KEY, team_id TEXT NOT NULL, competition TEXT NOT NULL, round TEXT NOT NULL, opponent TEXT NOT NULL, starts_at TEXT NOT NULL, venue TEXT NOT NULL, home INTEGER NOT NULL, goals_for INTEGER, goals_against INTEGER, source TEXT NOT NULL)'),
+ db.prepare('CREATE TABLE IF NOT EXISTS sf_availability_log (id TEXT PRIMARY KEY, event_id TEXT NOT NULL, player_id TEXT NOT NULL, status TEXT NOT NULL, changed_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+ ]);}catch(e){console.error('Season schema',e);return err('Inizializzazione moduli stagione non riuscita',503)}
  if(request.method==='GET'&&p==='/api/status'){try{await db.prepare('SELECT id FROM users LIMIT 1').first();return json({ok:true})}catch{return err('Schema non applicato. Esegui schema.sql nel database D1.',503)}}
  const adminToken=(request.headers.get('cookie')||'').match(/(?:^|;\s*)sf_admin=([a-f0-9]{64})(?:;|$)/)?.[1];
  const adminSession=adminToken?await db.prepare("SELECT id_hash FROM sf_admin_sessions WHERE id_hash=? AND expires_at>datetime('now')").bind(await sha(adminToken)).first():null;
@@ -144,6 +153,12 @@ export async function onRequest({request,env}){
      await db.prepare('DELETE FROM sessions WHERE user_id=?').bind(b.userId).run();
      await db.prepare('INSERT INTO admin_audit(id,actor_email,action,target) VALUES(?,?,?,?)').bind(uid(),adminUser.email,'revoke_sessions',b.userId).run();return json({ok:true})
     }
+    if(b.op==='adminUpdateTeam'){
+     if(!valid(b.teamId,100)||!valid(b.name,100)||![5,7,11].includes(Number(b.format)))return err('Dati squadra non validi');
+     let team=await db.prepare('SELECT id FROM teams WHERE id=?').bind(b.teamId).first();if(!team)return err('Squadra non trovata',404);
+     await db.prepare('UPDATE teams SET name=?,format=? WHERE id=?').bind(clean(b.name,100),Number(b.format),b.teamId).run();
+     return json({ok:true});
+    }
     if(b.op==='adminRenameTeam'){
      if(!valid(b.teamId,100)||!valid(b.name,100))return err('Dati non validi');
      let r=await db.prepare('UPDATE teams SET name=? WHERE id=?').bind(clean(b.name,100),b.teamId).run();if(!r.meta.changes)return err('Squadra non trovata',404);
@@ -155,7 +170,25 @@ export async function onRequest({request,env}){
   }catch(e){console.error('Admin API',e);return err('Operazione ADMIN non completata: '+String(e?.message||'errore database').slice(0,350),500)}
  }
  if(request.method==='GET'&&p==='/api/me'){let u=await auth(db,request);if(!u)return json({user:null,teams:[]});if(await db.prepare('SELECT 1 FROM sf_disabled_users WHERE user_id=?').bind(u.id).first())return json({user:null,teams:[]});let teams=await db.prepare("SELECT t.*,m.role FROM teams t JOIN team_members m ON t.id=m.team_id WHERE m.user_id=? AND NOT EXISTS (SELECT 1 FROM sf_disabled_teams d WHERE d.team_id=t.id) AND NOT EXISTS (SELECT 1 FROM sf_subscriptions s WHERE s.team_id=t.id AND (s.status IN ('expired','cancelled','past_due') OR (s.ends_at IS NOT NULL AND substr(s.ends_at,1,10)<date('now')))) ORDER BY t.created_at DESC").bind(u.id).all();return json({user:u,teams:teams.results,isAdmin:false})}
+ if(request.method==='GET'&&p==='/api/season'){
+  let u=await auth(db,request),id=url.searchParams.get('id');if(!await teamAuth(db,u,id))return err('Accesso negato',403);
+  const [tactics,progress,finances,fixtures]=await Promise.all([
+   db.prepare('SELECT * FROM sf_tactics WHERE team_id=? ORDER BY created_at DESC').bind(id).all(),
+   db.prepare('SELECT * FROM sf_progress WHERE team_id=? ORDER BY recorded_at DESC').bind(id).all(),
+   db.prepare('SELECT * FROM sf_finances WHERE team_id=? ORDER BY occurred_at DESC').bind(id).all(),
+   db.prepare('SELECT * FROM sf_fixtures WHERE team_id=? ORDER BY starts_at').bind(id).all()]);
+  return json({tactics:tactics.results,progress:progress.results,finances:finances.results,fixtures:fixtures.results});
+ }
  if(request.method==='GET'&&p==='/api/team'){let u=await auth(db,request),id=url.searchParams.get('id');if(!await teamAuth(db,u,id))return err('Accesso non autorizzato',403);let [team,players,events,callups]=await Promise.all([db.prepare('SELECT * FROM teams WHERE id=?').bind(id).first(),db.prepare('SELECT id,name,number,role FROM players WHERE team_id=? ORDER BY name').bind(id).all(),db.prepare('SELECT * FROM events WHERE team_id=? ORDER BY starts_at DESC LIMIT 150').bind(id).all(),db.prepare('SELECT c.event_id,c.player_id,c.status FROM callups c JOIN events e ON e.id=c.event_id WHERE e.team_id=?').bind(id).all()]);let responses=await db.prepare('SELECT a.event_id,a.player_id,a.status FROM availability a JOIN events e ON e.id=a.event_id WHERE e.team_id=?').bind(id).all();return json({team,players:players.results,events:events.results,callups:callups.results,responses:responses.results})}
+ if(request.method==='GET'&&p==='/api/event-response'){
+  const t=url.searchParams.get('token')||'';if(!/^[a-f0-9]{64}$/.test(t))return err('Link non valido',403);
+  const ev=await db.prepare('SELECT e.id,e.title,e.starts_at,e.venue,e.team_id,t.name team_name FROM sf_event_links l JOIN events e ON e.id=l.event_id JOIN teams t ON t.id=e.team_id WHERE l.token_hash=?').bind(await sha(t)).first();
+  if(!ev)return err('Link scaduto o inesistente',404);
+  if(await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(ev.team_id).first())return err('Squadra sospesa',403);
+  let sub=await db.prepare('SELECT status,ends_at FROM sf_subscriptions WHERE team_id=?').bind(ev.team_id).first();if(sub&&(['expired','cancelled','past_due'].includes(sub.status)||(sub.ends_at&&sub.ends_at.slice(0,10)<new Date().toISOString().slice(0,10))))return err('Abbonamento non attivo',403);
+  const players=await db.prepare('SELECT p.id,p.name,p.number,a.status FROM players p LEFT JOIN availability a ON a.player_id=p.id AND a.event_id=? WHERE p.team_id=? ORDER BY p.name').bind(ev.id,ev.team_id).all();
+  return json({event:{id:ev.id,title:ev.title,starts_at:ev.starts_at,venue:ev.venue,team_name:ev.team_name},players:players.results});
+ }
  if(request.method==='GET'&&p==='/api/player'){let t=url.searchParams.get('token');if(!t||!/^[a-f0-9]{64}$/.test(t))return err('Link non valido',403);let player=await db.prepare('SELECT p.id,p.name,p.team_id,t.name AS team_name FROM player_links l JOIN players p ON p.id=l.player_id JOIN teams t ON t.id=p.team_id WHERE l.token_hash=?').bind(await sha(t)).first();if(!player)return err('Link non valido o revocato',403);if(await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(player.team_id).first())return err('Squadra sospesa',403);let ps=await db.prepare('SELECT status,ends_at FROM sf_subscriptions WHERE team_id=?').bind(player.team_id).first();if(ps&&( ['expired','cancelled','past_due'].includes(ps.status)||(ps.ends_at&&ps.ends_at.slice(0,10)<new Date().toISOString().slice(0,10))))return err('Abbonamento squadra non attivo',403);let events=await db.prepare("SELECT e.id,e.title,e.type,e.starts_at,e.venue,e.opponent,a.status AS my_status,c.status AS callup FROM events e LEFT JOIN availability a ON a.event_id=e.id AND a.player_id=? LEFT JOIN callups c ON c.event_id=e.id AND c.player_id=? WHERE e.team_id=? AND e.starts_at>=datetime('now','-1 day') ORDER BY e.starts_at LIMIT 40").bind(player.id,player.id,player.team_id).all();return json({player,events:events.results})}
  if(request.method!=='POST')return err('Metodo non consentito',405);
  if(!request.headers.get('content-type')?.startsWith('application/json'))return err('Invia JSON',415);
@@ -165,12 +198,50 @@ export async function onRequest({request,env}){
  try{
  if(op==='register')return err('Registrazione pubblica disabilitata: richiedi l’accesso all’amministratore',403);
  if(op==='login'){let email=clean(b.email,254).toLowerCase(),u=await db.prepare('SELECT * FROM users WHERE email=?').bind(email).first();if(!u||await hashPassword(b.password||'',u.salt)!==u.password_hash)return err('Credenziali non valide',401);if(await db.prepare('SELECT 1 FROM sf_disabled_users WHERE user_id=?').bind(u.id).first())return err('Account disattivato. Contatta ADMIN',403);let active=await db.prepare('SELECT 1 FROM team_members m LEFT JOIN sf_disabled_teams d ON d.team_id=m.team_id WHERE m.user_id=? AND d.team_id IS NULL LIMIT 1').bind(u.id).first();if(!active)return err('Nessuna squadra attiva assegnata',403);let t=token();await db.prepare("INSERT INTO sessions(id_hash,user_id,expires_at) VALUES(?,?,datetime('now','+30 days'))").bind(await sha(t),u.id).run();return json({ok:true},200,{'set-cookie':cookie(t,2592000)})}
+ if(op==='eventResponse'){
+  if(!/^[a-f0-9]{64}$/.test(b.token||'')||!valid(b.playerId,100)||!['yes','no','maybe'].includes(b.status))return err('Risposta non valida');
+  const ev=await db.prepare('SELECT e.id,e.team_id FROM sf_event_links l JOIN events e ON e.id=l.event_id WHERE l.token_hash=?').bind(await sha(b.token)).first();if(!ev)return err('Link non valido',403);
+  const pl=await db.prepare('SELECT id FROM players WHERE id=? AND team_id=?').bind(b.playerId,ev.team_id).first();if(!pl)return err('Giocatore non presente nella rosa',403);
+  if(await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(ev.team_id).first())return err('Squadra sospesa',403);
+  let sub=await db.prepare('SELECT status,ends_at FROM sf_subscriptions WHERE team_id=?').bind(ev.team_id).first();if(sub&&(['expired','cancelled','past_due'].includes(sub.status)||(sub.ends_at&&sub.ends_at.slice(0,10)<new Date().toISOString().slice(0,10))))return err('Abbonamento non attivo',403);
+  await db.batch([db.prepare('INSERT INTO availability(event_id,player_id,status,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(event_id,player_id) DO UPDATE SET status=excluded.status,updated_at=CURRENT_TIMESTAMP').bind(ev.id,pl.id,b.status),db.prepare('INSERT INTO sf_availability_log(id,event_id,player_id,status) VALUES(?,?,?,?)').bind(uid(),ev.id,pl.id,b.status)]);
+  return json({ok:true});
+ }
  if(op==='availability'){let t=b.token;if(typeof t!=='string'||!/^[a-f0-9]{64}$/.test(t)||!['yes','no','maybe'].includes(b.status))return err('Dati non validi');let row=await db.prepare('SELECT p.id,p.team_id FROM player_links l JOIN players p ON p.id=l.player_id WHERE l.token_hash=?').bind(await sha(t)).first();if(!row)return err('Link non valido',403);if(await db.prepare('SELECT 1 FROM sf_disabled_teams WHERE team_id=?').bind(row.team_id).first())return err('Squadra sospesa',403);let asub=await db.prepare('SELECT status,ends_at FROM sf_subscriptions WHERE team_id=?').bind(row.team_id).first();if(asub&&(['expired','cancelled','past_due'].includes(asub.status)||(asub.ends_at&&asub.ends_at.slice(0,10)<new Date().toISOString().slice(0,10))))return err('Abbonamento squadra non attivo',403);let ev=await db.prepare('SELECT id FROM events WHERE id=? AND team_id=?').bind(b.eventId,row.team_id).first();if(!ev)return err('Evento non trovato',404);await db.prepare("INSERT INTO availability(event_id,player_id,status,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(event_id,player_id) DO UPDATE SET status=excluded.status,updated_at=CURRENT_TIMESTAMP").bind(ev.id,row.id,b.status).run();return json({ok:true})}
  let u=await auth(db,request);if(!u)return err('Effettua il login',401);
  if(op==='logout'){let t=(request.headers.get('cookie')||'').match(/sf_session=([a-f0-9]{64})/)?.[1];if(t)await db.prepare('DELETE FROM sessions WHERE id_hash=?').bind(await sha(t)).run();return json({ok:true},200,{'set-cookie':cookie('',0)})}
  if(op==='createTeam')return err('Solo ADMIN può creare squadre',403);
  if(false&&op==='createTeam'){if(!valid(b.name,100)||![5,7,11].includes(Number(b.format)))return err('Nome o formato non valido');let id=uid();await db.batch([db.prepare('INSERT INTO teams(id,name,format) VALUES(?,?,?)').bind(id,clean(b.name,100),Number(b.format)),db.prepare("INSERT INTO team_members(team_id,user_id,role) VALUES(?,?,'owner')").bind(id,u.id)]);return json({ok:true,id})}
  let member=await teamAuth(db,u,b.teamId);if(!member)return err('Non hai accesso a questa squadra',403);
+ if(op==='eventLink'){
+  const e=await db.prepare('SELECT id FROM events WHERE id=? AND team_id=?').bind(b.eventId,b.teamId).first();if(!e)return err('Evento inesistente',404);
+  const t=token();await db.prepare('INSERT INTO sf_event_links(event_id,token_hash) VALUES(?,?) ON CONFLICT(event_id) DO UPDATE SET token_hash=excluded.token_hash,created_at=CURRENT_TIMESTAMP').bind(e.id,await sha(t)).run();return json({ok:true,url:url.origin+'/?event='+t,warning:'Un nuovo link revoca quello precedente.'});
+ }
+ if(op==='saveTactic'){
+  if(!valid(b.title,100)||!valid(b.formation,40)||!['offense','defense','transition','setpiece'].includes(b.phase)||!Array.isArray(b.positions)||b.positions.length>30)return err('Tattica non valida');
+  const positions=b.positions.map(x=>({name:clean(x.name,60),x:Math.max(0,Math.min(100,Number(x.x)||0)),y:Math.max(0,Math.min(100,Number(x.y)||0))}));
+  const id=uid();await db.prepare('INSERT INTO sf_tactics(id,team_id,title,formation,phase,positions,notes) VALUES(?,?,?,?,?,?,?)').bind(id,b.teamId,clean(b.title,100),clean(b.formation,40),b.phase,JSON.stringify(positions),clean(b.notes,4000)).run();return json({ok:true,id});
+ }
+ if(op==='saveProgress'){
+  if(!valid(b.category,80)||!/^\d{4}-\d{2}-\d{2}$/.test(b.recordedAt||'')||!Number.isInteger(Number(b.score))||Number(b.score)<1||Number(b.score)>10)return err('Valutazione non valida');
+  if(b.playerId){let pl=await db.prepare('SELECT id FROM players WHERE id=? AND team_id=?').bind(b.playerId,b.teamId).first();if(!pl)return err('Giocatore non valido',403)}
+  let id=uid();await db.prepare('INSERT INTO sf_progress(id,team_id,player_id,recorded_at,category,score,strengths,improvements,action_plan) VALUES(?,?,?,?,?,?,?,?,?)').bind(id,b.teamId,b.playerId||null,b.recordedAt,clean(b.category,80),Number(b.score),clean(b.strengths,2000),clean(b.improvements,2000),clean(b.actionPlan,2000)).run();return json({ok:true,id});
+ }
+ if(op==='saveFinance'){
+  const cents=Math.round(Number(b.amount)*100);if(!['income','expense'].includes(b.kind)||!valid(b.title,150)||!Number.isSafeInteger(cents)||cents<=0||cents>100000000||!/^\d{4}-\d{2}-\d{2}$/.test(b.occurredAt||''))return err('Movimento non valido');
+  if(b.playerId){let pl=await db.prepare('SELECT id FROM players WHERE id=? AND team_id=?').bind(b.playerId,b.teamId).first();if(!pl)return err('Giocatore non valido',403)}
+  let id=uid();await db.prepare('INSERT INTO sf_finances(id,team_id,player_id,kind,amount_cents,title,occurred_at,notes) VALUES(?,?,?,?,?,?,?,?)').bind(id,b.teamId,b.playerId||null,b.kind,cents,clean(b.title,150),b.occurredAt,clean(b.notes,1000)).run();return json({ok:true,id});
+ }
+ if(op==='saveFixture'){
+  if(!valid(b.opponent,120)||!valid(b.competition,120)||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(b.startsAt||''))return err('Dati partita non validi');
+  const gf=b.goalsFor===''||b.goalsFor==null?null:Number(b.goalsFor),ga=b.goalsAgainst===''||b.goalsAgainst==null?null:Number(b.goalsAgainst);
+  if([gf,ga].some(x=>x!==null&&(!Number.isInteger(x)||x<0||x>99)))return err('Risultato non valido');
+  let id=uid();await db.prepare('INSERT INTO sf_fixtures(id,team_id,competition,round,opponent,starts_at,venue,home,goals_for,goals_against,source) VALUES(?,?,?,?,?,?,?,?,?,?,?)').bind(id,b.teamId,clean(b.competition,120),clean(b.round,40),clean(b.opponent,120),b.startsAt,clean(b.venue,120),b.home?1:0,gf,ga,clean(b.source,300)).run();return json({ok:true,id});
+ }
+ if(op==='deleteSeasonItem'){
+  const tables={tactic:'sf_tactics',progress:'sf_progress',finance:'sf_finances',fixture:'sf_fixtures'};const table=tables[b.kind];if(!table||!valid(b.id,100))return err('Elemento non valido');
+  const r=await db.prepare('DELETE FROM '+table+' WHERE id=? AND team_id=?').bind(b.id,b.teamId).run();return json({ok:r.meta.changes>0});
+ }
  if(op==='addPlayer'){if(!valid(b.name,100))return err('Inserisci il nome');let number=b.number===''||b.number==null?null:Number(b.number);if(number!==null&&(!Number.isInteger(number)||number<0||number>99))return err('Numero maglia non valido');let id=uid();await db.prepare('INSERT INTO players(id,team_id,name,number,role) VALUES(?,?,?,?,?)').bind(id,b.teamId,clean(b.name,100),number,clean(b.role,50)).run();return json({ok:true,id})}
  if(op==='deletePlayer'){let r=await db.prepare('DELETE FROM players WHERE id=? AND team_id=?').bind(b.playerId,b.teamId).run();return json({ok:r.meta.changes>0})}
  if(op==='addEvent'){if(!valid(b.title,120)||!['training','match','other'].includes(b.type)||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(b.startsAt))return err('Dati evento non validi');let id=uid();await db.prepare('INSERT INTO events(id,team_id,type,title,starts_at,venue,opponent) VALUES(?,?,?,?,?,?,?)').bind(id,b.teamId,b.type,clean(b.title,120),b.startsAt,clean(b.venue,120),clean(b.opponent,120)).run();return json({ok:true,id})}
