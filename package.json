@@ -1,0 +1,1 @@
+{"name":"squadrafacile","version":"0.1.0","private":true,"scripts":{"dev":"wrangler pages dev public --d1 DB=squadrafacile-db","deploy":"wrangler pages deploy public --project-name squadrafacile"},"devDependencies":{"wrangler":"^4.0.0"}}

@@ -1,0 +1,9 @@
+name = "squadrafacile"
+compatibility_date = "2026-10-01"
+pages_build_output_dir = "./public"
+
+# Dopo aver creato il database D1, inserisci il database_id ottenuto da Cloudflare.
+[[d1_databases]]
+binding = "DB"
+database_name = "squadrafacile-db"
+database_id = "INSERISCI_DATABASE_ID"
