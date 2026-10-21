@@ -6,4 +6,4 @@ pages_build_output_dir = "./public"
 [[d1_databases]]
 binding = "DB"
 database_name = "squadrafacile-db"
-database_id = "INSERISCI_DATABASE_ID"
+database_id = "062a17c6-292e-4520-a480-f0c6c718d744"
