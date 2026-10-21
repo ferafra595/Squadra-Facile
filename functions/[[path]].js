@@ -17,6 +17,17 @@ export async function onRequest({request,env}){
  if(!p.startsWith('/api/'))return env.ASSETS.fetch(request);
  if(!env.DB)return err('Database D1 non collegato: aggiungi il binding DB su Cloudflare Pages.',503);
  const db=env.DB;
+ // Ensure ADMIN-only tables exist before checking sessions or accepting login.
+ // This makes first-time setup safe without a manual D1 migration.
+ if(p.startsWith('/api/admin')){
+  try{
+   await db.batch([
+    db.prepare('CREATE TABLE IF NOT EXISTS sf_admin_sessions (id_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL)'),
+    db.prepare('CREATE TABLE IF NOT EXISTS sf_disabled_teams (team_id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)'),
+    db.prepare('CREATE TABLE IF NOT EXISTS admin_audit (id TEXT PRIMARY KEY, actor_email TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+   ]);
+  }catch(e){console.error('ADMIN schema initialization failed',e);return err('Impossibile inizializzare le tabelle ADMIN. Controlla il collegamento DB.',503)}
+ }
  if(request.method==='GET'&&p==='/api/status'){try{await db.prepare('SELECT id FROM users LIMIT 1').first();return json({ok:true})}catch{return err('Schema non applicato. Esegui schema.sql nel database D1.',503)}}
  const adminToken=(request.headers.get('cookie')||'').match(/(?:^|;\s*)sf_admin=([a-f0-9]{64})(?:;|$)/)?.[1];
  const adminSession=adminToken?await db.prepare("SELECT id_hash FROM sf_admin_sessions WHERE id_hash=? AND expires_at>datetime('now')").bind(await sha(adminToken)).first():null;
