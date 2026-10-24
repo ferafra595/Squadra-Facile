@@ -16,6 +16,38 @@ async function teamAuthPublic(db,id){if(await db.prepare('SELECT 1 FROM sf_disab
 export async function onRequest({request,env}){
  const url=new URL(request.url),p=url.pathname;
  if(!p.startsWith('/api/'))return env.ASSETS.fetch(request);
+ if(request.method==='GET'&&p==='/api/lnd/sources'){
+  const c=url.searchParams.get('competition')||'eccellenza';
+  const catalog={
+   eccellenza:{url:'https://calabria.lnd.it/regionale/svelati-i-calendari-dei-campionati-di-eccellenza-e-promozione/',label:'Eccellenza 2026/2027',status:'Calendario pubblicato il 4 settembre 2026'},
+   promozione:{url:'https://calabria.lnd.it/regionale/svelati-i-calendari-dei-campionati-di-eccellenza-e-promozione/',label:'Promozione gironi A e B 2026/2027',status:'Calendari pubblicati il 4 settembre 2026'},
+   prima:{url:'https://calabria.lnd.it/regionale/presentati-i-calendari-del-campionato-di-prima-categoria/',label:'Prima Categoria gironi A-D 2026/2027',status:'Calendari pubblicati il 21 settembre 2026'},
+   seconda:{url:'https://calabria.lnd.it/comunicati/',label:'Seconda Categoria 2026/2027',status:'Controllare i comunicati dei singoli gironi'},
+   terza:{url:'https://calabria.lnd.it/regionale/terza-categoria-organico-e-gironi-stagione-sportiva-2026-2027/',label:'Terza Categoria 2026/2027',status:'Al 22 ottobre pubblicati i gironi, calendari annunciati successivamente'},
+   c5:{url:'https://calabria.lnd.it/comunicati/',label:'Calcio a 5 C1 e C2 2026/2027',status:'Comunicati ufficiali calendari di settembre 2026'}
+  };
+  if(!Object.hasOwn(catalog,c))return err('Competizione sconosciuta',400);
+  const entry=catalog[c];let sources=[entry];
+  // Retrieve only a hardcoded official LND page, never an arbitrary URL.
+  if(c==='eccellenza'||c==='promozione'||c==='prima'){
+   try{
+    const resp=await fetch(entry.url,{headers:{'accept':'text/html'},signal:AbortSignal.timeout(6500)});
+    if(resp.ok){const html=(await resp.text()).slice(0,650000);const found=[];const re=/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;let m;
+     while((m=re.exec(html))&&found.length<30){const href=m[1].replace(/&amp;/g,'&'),label=m[2].replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();let target;try{target=new URL(href,entry.url)}catch{continue}
+      if(target.protocol!=='https:'||!target.hostname.endsWith('calabria.lnd.it'))continue;
+      if(!/calendari?|girone/i.test(label+' '+target.pathname))continue;
+      if(!/\.(pdf|png|jpe?g)(\?|$)/i.test(target.pathname))continue;
+      if(c==='eccellenza'&&!/eccellenza/i.test(label+' '+target.pathname))continue;
+      if(c==='promozione'&&!/promozione|girone/i.test(label+' '+target.pathname))continue;
+      found.push({label:label||'Documento ufficiale',url:target.href,status:'Documento pubblicato sul sito LND Calabria'});
+     }
+     if(found.length)sources=[...found,entry];
+    }
+   }catch(e){console.warn('LND sources lookup failed:',String(e).slice(0,100))}
+  }
+  return json({competition:c,season:'2026/2027',sources,note:'Documenti ufficiali individuati. Le singole partite non vengono estratte né importate automaticamente da PDF/immagini; controllare anche gli aggiornamenti successivi.'});
+ }
+
  if(!env.DB)return err('Database D1 non collegato: aggiungi il binding DB su Cloudflare Pages.',503);
  const db=env.DB;
  // Ensure ADMIN-only tables exist before checking sessions or accepting login.
